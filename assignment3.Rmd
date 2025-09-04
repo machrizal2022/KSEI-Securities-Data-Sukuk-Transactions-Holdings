@@ -1,0 +1,459 @@
+---
+title: 'Assignment 3 :  Introduction to Data Science'
+author: "machrizal"
+date: "2025-09-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r include=FALSE}
+# Set up libraries needed
+setup_library <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package)
+    library(package, character.only = TRUE)
+  }
+}
+
+# List of packages to load
+packages <- c(
+  "Metrics",
+  "Matrix",
+  "xgboost",
+  "dplyr",
+  "tidyverse",
+  "this.path",
+  "janitor",
+  "psych",
+  "ggplot2",
+  "visdat",
+  "lubridate",
+  "scales",
+  "corrplot",
+  "readr",
+  "moments",
+  "knitr",
+  "gridExtra",
+  "reshape2",
+  "tidyr",
+  "stringr",
+  "httr",
+  "readxl",
+  "janitor"
+)
+
+lapply(packages, setup_library)
+
+# Set working directory to this Rmd file located
+url <- "https://raw.githubusercontent.com/machrizal2022/KSEI-Securities-Data-Sukuk-Transactions-Holdings/main/sukukrealfix.csv"
+df <- read_csv(url)
+
+# Clean column names
+library(janitor)
+df <- janitor::clean_names(df)
+
+```
+
+
+```{r, fig.width=10, fig.height=8}
+vis_miss(df)
+```
+Rows with abnormally low or zero yields that still attracted strong demand were removed from the dataset, as such instruments would not normally interest rational investors. The UK Financial Conduct Authority (FCA, 2025) identifies “uneconomic or irrational trading strategies” lacking economic sense as key indicators of potential money laundering. Since further forensic inquiry is beyond this assignment’s scope, these anomalies were treated as invalid to maintain analytical integrity.
+
+Financial Conduct Authority (FCA). (2025). Money laundering through markets review. https://www.fca.org.uk/publication/corporate/money-laundering-through-markets-review-january-2025.pdf
+
+
+```{r}
+# 3) Set interest = 0 for "sukuk crowdfunding" 
+if ("interest" %in% names(df)) {
+  df <- df  %>%
+    mutate(interest = num(interest),
+           interest = ifelse((("type" %in% names(df)) &
+                                str_detect(str_to_lower(type), "crowd")
+           ) |
+             (("description" %in% names(df)) &
+                str_detect(str_to_lower(description), "crowd")
+             ), 0, interest))
+}
+
+df <- df %>% 
+  filter(!is.na(interest))
+```
+
+
+```{r}
+# 4) delete column "current aminities" & "Total Scripless" 
+df <- df  %>% 
+  select(-any_of(c("current_amt","total_scripless")))
+```
+
+
+
+
+data preprocessing and cleaning
+```{r}
+# 2) Combine Local_* + Foreign_* into new columns, then make 'totl' and drop sources (except IS as requested)
+num <- function(x) parse_number(as.character(x))
+
+df <- df  %>% 
+  mutate(
+    securities_firms     = num(local_is) + num(foreign_is),
+    pension_funds        = num(local_cp) + num(foreign_cp),
+    financing_comp       = num(local_pf) + num(foreign_pf),
+    investment_banks     = num(local_ib) + num(foreign_ib),
+    institutional_invest = num(local_id) + num(foreign_id),
+    mutual_funds         = num(local_mf) + num(foreign_mf),
+    securities_comp      = num(local_sc) + num(foreign_sc),
+    direct               = num(local_fd) + num(foreign_fd),
+    other                = num(local_ot) + num(foreign_ot),
+    total = rowSums(across(c(securities_firms, pension_funds, financing_comp, investment_banks,
+                            institutional_invest, mutual_funds, securities_comp, direct, other)), na.rm = TRUE)
+  )  %>% 
+  select(-any_of(c("local_cp","foreign_cp","local_pf","foreign_pf","local_ib","foreign_ib",
+                   "local_id","foreign_id","local_mf","foreign_mf","local_sc","foreign_sc",
+                   "local_fd","foreign_fd","local_ot","foreign_ot","total_foreign","total_local",
+                   "local_is","foreign_is","securities_firms", "pension_funds", "financing_comp", "investment_banks",
+                            "institutional_invest", "mutual_funds", "securities_comp", "direct", "other")))
+```
+
+
+```{r}
+# 5) Parse tanggal & 'mature' (tahun sejak listing hingga maturity)
+to_date <- function(x) {
+  if (is.numeric(x)) as.Date(x, origin = "1899-12-30")
+  else as.Date(parse_date_time(as.character(x), orders = c("ymd","dmy","mdy")), origin = "1970-01-01")
+}
+date_cols <- intersect(names(df), c("date","listing_date","maturity_date"))
+if (length(date_cols)) df <- df |> mutate(across(all_of(date_cols), to_date))
+
+if (all(c("listing_date","maturity_date") %in% names(df))) {
+  df <- df |> mutate(mature = as.numeric(maturity_date - listing_date) / 365.25)
+}
+
+write.csv(df,"clean.csv")
+```
+
+
+data Preprocessing
+```{r}
+
+
+df <- df %>%
+  mutate(
+    interest_freq_clean = str_trim(str_to_lower(interest_freq)),
+
+    interest_freq_num = case_when(
+      interest_freq_clean == "specific date" ~ 1,
+      interest_freq_clean == "monthly"       ~ 12,
+      interest_freq_clean == "3 months"      ~ 4,
+      interest_freq_clean == "4 months"      ~ 3,
+      interest_freq_clean == "semi-annual"   ~ 2
+    ),
+
+    payments_count = as.integer(round(mature * interest_freq_num))
+    
+  ) %>%
+  select(-interest_freq_clean)
+
+```
+
+
+```{r}
+# 7) Metrik pasar: curr_amt, days_purchase, sold_per_day
+df <- df  %>% 
+  mutate(
+    curr_amt = originated_amt - total
+  )
+
+if (all(c("date","listing_date") %in% names(df))) {
+  df <- df  %>%  mutate(days_purchase = as.numeric(date - listing_date)+ 1)
+}
+
+df <- df %>% 
+  mutate(
+    sold_per_day = as.numeric(total / days_purchase),
+    sold_ratio    = as.numeric (total / originated_amt),
+    sold_speed_pct_per_day = sold_ratio / days_purchase
+  )
+
+# 8) sector_type mapping lalu drop 'sector'
+map_sector <- function(x) {
+  s <- toupper(trimws(as.character(x)))
+  case_when(
+    # Finance
+    s %in% c("GOVERNMENT","BANK","FINANCIAL INSTITUTION","INVESTMENT COMPANY","OTHERS - FINANCE") ~ "Finance",
+    # Consumer & Services
+    s %in% c("ADVERTISING,PRINTING AND MEDIA","COSMETICS AND HOUSEHOLD","FOOD & BEVERAGES","HOUSEWARE",
+             "PHARMACEUTICALS","HEALTH CARE","RESTAURANT, HOTEL & TOURISM","TEXTILE, GARMENT",
+             "TELECOMUNICATION","OTHERS - CONSUMER GOODS INDUSTRY","OTHERS - TRADE, SERVICES & INVESTMENT") ~ "Consumer & Services",
+    # Industry & Manufacturing
+    s %in% c("AUTOMOTIVE AND COMPONENTS","BUILDING CONSTRUCTION","CONSTRUCTION","NON BUILDING CONSTRUCTION",
+             "ELECTRONICS","MACHINERY AND HEAVY EQUIPMENT","PLASTICS & PACKAGING","PULP & PAPER",
+             "WOOD INDUSTRIES","OTHER - BASIC INDUSTRY AND CHEMICALS","OTHER SECTORS","COMPUTER AND SERVICES") ~ "Industry & Manufacturing",
+    # Natural Resources
+    s %in% c("ANIMAL HUSBANDRY","COAL MINING","CRUDE PETROLEUM & NATURAL GAS PROD.","FISHERY",
+             "LAND/STONE QUARRYING","METAL AND ALLIED PRODUCTS","METAL AND MINERAL MINING",
+             "PLANTATION","ENERGY","OTHERS - MINING") ~ "Natural Resources",
+    # Infrastructure & Transportation
+    s %in% c("TOLL ROAD, AIRPORT, HARBOR & ALLIED PROD.","TRANSPORTATION","PROPERTY AND REAL ESTATE",
+             "OTHERS - INFRASTRUCTURE, UTILITIES & TRANSPORTATIO") ~ "Infrastructure & Transportation",
+    # Government
+    #s %in% c("GOVERNMENT") ~ "Government",
+    TRUE ~ NA_character_
+  )
+}
+
+if ("sector" %in% names(df)) {
+  df <- df |> mutate(sector_type = map_sector(sector)) |> select(-sector)
+}
+
+df <- df |>
+  mutate(
+    payments_total = ifelse(!is.na(payments_count) & !is.na(interest) & !is.na(total),
+                            payments_count * (interest/100) * total, NA_real_)
+  )
+```
+
+```{r, fig.width=10, fig.height=8}
+sapply(df, function(x) sum(is.na(x)))
+```
+```{r}
+str(df)
+```
+
+
+
+```{r, fig.width=10, fig.height=8}
+write_csv(df,"cleaned_lm.csv")
+# pilih hanya kolom numeric/integer
+num_df <- dplyr::select_if(df, is.numeric)
+
+# hitung correlation matrix
+cor_matrix <- cor(num_df, use = "complete.obs")
+
+# Create the correlation plot visualization
+corrplot(cor_matrix, 
+         method = "circle",           # Use circles instead of squares
+         type = "full",               # Show full matrix, not just upper/lower triangle
+         col = colorRampPalette(c("red", "white", "steelblue"))(150),  # Custom color palette
+         addCoef.col = "black",       # Show correlation coefficients in black
+         number.cex = 0.7,            # Size of correlation text
+         tl.col = "black",            # Text label color
+         tl.srt = 45,                 # Rotate text labels
+         diag = TRUE,                 # Show diagonal elements
+         mar = c(0, 0, 1, 0),         # Margins
+         title = "Correlation Matrix",
+         tl.cex = 0.8,                # Text label size
+         cl.cex = 0.8,                # Color legend text size
+         cl.ratio = 0.15,             # Color legend width ratio
+         cl.align = "r",              # Color legend alignment
+         order = "hclust",            # Hierarchical clustering order
+         addrect = 3,                 # Add rectangles around clusters
+         rect.col = "black",          # Rectangle color
+         rect.lwd = 3,                # Rectangle line width
+         is.corr = TRUE)              # Confirm it's a correlation matrix
+```
+
+```{r}
+describe(df)
+```
+```{r, fig.width=10, fig.height=8}
+# melt ke long
+dt_long <- melt(num_df,
+                variable.name = "variable",
+                value.name = "value",
+                na.rm = TRUE)
+
+ggplot(dt_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~ variable, scales = "free", ncol = 5) +
+  labs(title = "Distribusi Semua Variabel Numerik",
+       x = NULL, y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+df2 <- num_df %>%
+  mutate(
+    sold_per_day_log = log1p(sold_per_day),
+    originated_amt_log = log1p(originated_amt),
+    total_log = log1p(total),
+    payments_total_log = log1p(payments_total)
+  ) %>% 
+  select(-sold_per_day,-originated_amt,total )
+```
+
+
+```{r}
+fit <- lm(sold_ratio ~. -curr_amt, data = df2)
+summary (fit)
+car::vif(fit)
+```
+
+
+
+
+```{r}
+library(dplyr)
+library(Matrix)
+library(xgboost)
+library(Metrics)
+
+df_guard <- df
+
+# Drop ID/textual columns (not suitable as predictors)
+drop_cols <- c("code","description","date","listing_date","maturity_date",
+               "issuer","type","sector_type")   
+
+feature_cols <- setdiff(names(df_guard), c(drop_cols, "sold_per_day"))
+
+# Convert factors into dummies (model matrix) and store as sparse matrix
+X <- model.matrix(~ . , data = df_guard[, feature_cols])[ , -1]
+X <- Matrix(X, sparse = TRUE)
+
+# Target variable
+y <- df_guard$sold_per_day
+keep <- !is.na(y) & is.finite(y)
+X <- X[keep, ]; y <- y[keep]
+
+# ===== 1) Train/Test split =====
+set.seed(123)
+idx <- sample(seq_len(nrow(X)), size = floor(0.8 * nrow(X)))
+dtrain <- xgb.DMatrix(X[idx, ],  label = y[idx])
+dtest  <- xgb.DMatrix(X[-idx, ], label = y[-idx])
+y_test <- y[-idx]
+
+
+```
+```{r}
+# ===== 2) Parameter setup & Cross-validation =====
+params <- list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.05,
+  max_depth = 6,
+  min_child_weight = 5,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  lambda = 1.0,    # L2 regularization
+  alpha  = 0.0,    # L1 regularization
+  nthread = max(1, parallel::detectCores() - 1)
+)
+
+set.seed(123)
+cv <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 5000,
+  nfold = 5,
+  early_stopping_rounds = 100,
+  verbose = 0
+)
+best_nrounds <- cv$best_iteration
+cat("Best nrounds from CV:", best_nrounds, "\n")
+```
+
+
+
+```{r}
+# ===== 3) Train final model =====
+set.seed(123)
+xgb_fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 100,
+  verbose = 1
+)
+```
+
+```{r}
+# ===== 4) Evaluation =====
+pred <- predict(xgb_fit, dtest)
+rmse_val <- rmse(y_test, pred)
+mae_val  <- mae (y_test, pred)
+r2_val   <- 1 - sum((y_test - pred)^2) / sum((y_test - mean(y_test))^2)
+cat(sprintf("Test RMSE = %.3f | MAE = %.3f | R^2 = %.4f\n", rmse_val, mae_val, r2_val))
+```
+
+```{r}
+# ===== 5) Visualization: Predicted vs Actual =====
+plot(y_test, pred,
+     xlab = "Actual sold_per_day", ylab = "Predicted sold_per_day",
+     main = "XGBoost: Predicted vs Actual", pch = 16, cex = 0.6)
+abline(0, 1, col = "red", lwd = 2)
+
+# Residual diagnostics
+resid <- y_test - pred
+hist(resid, breaks = 40, main = "Residuals Histogram", xlab = "Residuals")
+plot(pred, resid, pch = 16, cex = 0.6,
+     xlab = "Predicted", ylab = "Residual",
+     main = "Residuals vs Predicted"); abline(h=0, col="red", lwd=2)
+```
+
+```{r}
+# ===== 6) Feature importance =====
+imp <- xgb.importance(model = xgb_fit, feature_names = colnames(X))
+print(head(imp, 20))
+# Plot if needed:
+xgb.plot.importance(imp[1:20, ])
+```
+
+
+```{r}
+# ===== 7) Tree structure example =====
+# Visualize the first decision tree
+xgb.plot.tree(model = xgb_fit, trees = 0)
+
+# Tree as data.table
+trees_dt <- xgb.model.dt.tree(model = xgb_fit)
+head(trees_dt[Tree == 0, ])
+```
+
+
+```{r}
+
+library(shapviz)
+
+X_pred_mat <- as.matrix(X[-idx, , drop = FALSE])
+
+sv <- shapviz(
+  xgb_fit,
+  X_pred = X_pred_mat,
+  y = y_test,
+  feature_names = colnames(X)
+)
+
+# Prefer explicit helpers (avoid generic plot ambiguity)
+sv_summary(sv)
+sv_importance(sv, kind = "bar")
+sv_dependence(sv, v = "interest")
+sv_waterfall(sv, row_id = 1)
+```
+
+
+```{r}
+# ===== 8) Feature importance =====
+imp <- xgb.importance(model = xgb_fit, feature_names = colnames(X))
+print(head(imp, 20))
+# Plot (aktifkan jika ingin)
+# xgb.plot.importance(imp[1:20, ])
+
+# ===== 9) (Opsional) Simpan model & prediksi =====
+# xgb.save(xgb_fit, "xgb_sold_per_day.model")
+# write.csv(data.frame(actual = y_test, pred = pred), "predictions_test.csv", row.names = FALSE)
+```
+
+
