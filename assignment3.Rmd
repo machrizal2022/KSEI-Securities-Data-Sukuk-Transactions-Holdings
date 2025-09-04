@@ -437,9 +437,19 @@ sv <- shapviz(
 )
 
 # Prefer explicit helpers (avoid generic plot ambiguity)
-sv_summary(sv)
+# ---- PLOTS (benar) ----
+# 1) "Summary" beeswarm (ganti sv_summary -> sv_importance(kind="bee"))
+sv_importance(sv, kind = "bee")
+
+summary(sv)
+
+# 2) Global importance (bar)
 sv_importance(sv, kind = "bar")
+
+# 3) Dependence (contoh pakai fitur "interest", sesuaikan nama kolom di mm)
 sv_dependence(sv, v = "interest")
+
+# 4) Waterfall untuk observasi ke-1
 sv_waterfall(sv, row_id = 1)
 ```
 
