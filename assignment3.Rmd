@@ -1,6 +1,6 @@
 ---
-title: 'Assignment 3 :  Introduction to Data Science'
-author: "machrizal"
+title: "Assignment 3 :  Predicting Sukuk Issuance Viability in Indonesia using Machine Learning"
+author: "Machrizal Perdana Putra / 34560351"
 date: "2025-09-01"
 output: html_document
 ---
@@ -11,12 +11,13 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, Psukuk, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
 
 When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
-
-```{r include=FALSE}
+# 1. SETUP
+Run the code chunks below to install the necessary packages before proceeding to the next steps.
+```{r}
 # Set up libraries needed
 setup_library <- function(package) {
   if (!require(package, character.only = TRUE)) {
@@ -27,6 +28,7 @@ setup_library <- function(package) {
 
 # List of packages to load
 packages <- c(
+  "conflicted",
   "Metrics",
   "Matrix",
   "xgboost",
@@ -49,63 +51,153 @@ packages <- c(
   "stringr",
   "httr",
   "readxl",
-  "janitor"
-)
+  "janitor",
+  "car",
+  "shapviz"
+  )
 
-lapply(packages, setup_library)
+invisible(lapply(packages, setup_library))
+```
+For this analysis, I used the Master File Securities and Holding Composition datasets, which provide detailed records of securities transactions and ownership data for 2023 and 2024. These include key variables such as buyer types, ownership structure, issuer classifications, interest rates, and other relevant attributes.
 
-# Set working directory to this Rmd file located
-url <- "https://raw.githubusercontent.com/machrizal2022/KSEI-Securities-Data-Sukuk-Transactions-Holdings/main/sukukrealfix.csv"
-df <- read_csv(url)
+After merging the data, I created a consolidated master file that presents a comprehensive overview of the Sukuk market for the period. Since the original datasets from KSEI (https://www.ksei.co.id/archive_download/master_securities and https://www.ksei.co.id/archive_download/holding_composition) require manual verification before download, they cannot be accessed directly in R.
+
+To support further processing and analysis, the finalized dataset—sukuk_master_own.csv—has been uploaded to GitHub.
+
+# 2. Dataset
+The dataset was imported from GitHub, with column names standardized using the janitor package. Columns that were null, duplicated, or irrelevant were dropped to simplify and streamline the data. Filtering was then applied to retain only Sukuk-related instruments—SUKUK, SBSN, SUKUK CROWD FUNDING, and SPN securities with SPNS codes—ensuring the dataset is clean and relevant to the analysis.
+```{r include=FALSE}
+
+# Load the combined dataset from GitHub for further analysis
+url <- "https://raw.githubusercontent.com/machrizal2022/KSEI-Securities-Data-Sukuk-Transactions-Holdings/main/sukuk_master_own.csv"
+sukuk <- read_csv(url)
 
 # Clean column names
 library(janitor)
-df <- janitor::clean_names(df)
+sukuk <- janitor::clean_names(sukuk)
 
+#drop unneccessary column ( with null value and duplicate)
+
+sukuk <- sukuk %>%
+  select(-any_of(
+    c(
+      "status",
+      "stock_exchange",
+      "currency",
+      "form",
+      "eff_date_isin",
+      "expire_date",
+      "exercise_price",
+      "nominal_value",
+      "num_of_sec",
+      "local_(%)",
+      "foreign_(%)",
+      "total_(%)",
+      "closing_price",
+      "sec_num",
+      'price2',
+      "local_percent",
+      "foreign_percent",
+      "total_percent"
+    )
+  ))
+
+# Filter the dataset to include only Sukuk-related instruments: SUKUK, SBSN, SUKUK CROWD FUNDING,
+# and SPN types specifically labeled with "SPNS" in their code
+conflicts_prefer(dplyr::filter)
+sukuk <- sukuk %>%
+  filter(
+    type %in% c("SUKUK", "SBSN", "SUKUK CROWD FUNDING") | 
+      (type == "SPN" & str_detect(code, "SPNS")))
 ```
 
+
+# 3.Data Preprocessing 
+
+The preprocessing phase focused on cleaning, transforming, and enriching the dataset to ensure accuracy and analytical consistency. As a first step, missing data was visualized using vis_miss() to identify incomplete columns. The plot revealed that while key fields such as date, code, type, and issuer_code were complete, other variables—including listing_date, interest, interest_type, interest_freq, current_amt, and sector—had missing values. These findings informed subsequent cleaning steps, where irrelevant columns were removed and critical fields were imputed based on domain context.
 
 ```{r, fig.width=10, fig.height=8}
-vis_miss(df)
+# Visualize the remaining missing values in the dataset after cleaning and imputation
+vis_miss(sukuk)
 ```
-Rows with abnormally low or zero yields that still attracted strong demand were removed from the dataset, as such instruments would not normally interest rational investors. The UK Financial Conduct Authority (FCA, 2025) identifies “uneconomic or irrational trading strategies” lacking economic sense as key indicators of potential money laundering. Since further forensic inquiry is beyond this assignment’s scope, these anomalies were treated as invalid to maintain analytical integrity.
 
-Financial Conduct Authority (FCA). (2025). Money laundering through markets review. https://www.fca.org.uk/publication/corporate/money-laundering-through-markets-review-january-2025.pdf
+
+A significant portion of missing values in the interest column was found to come from Sukuk Crowd Funding and Sukuk instruments. Upon review, entries under Sukuk Crowd Funding were identified as waqf-based or social instruments that do not offer returns, and were therefore imputed with an interest rate of 0%. For other Sukuk entries with abnormally low or zero yields despite high investor demand, these were considered economic anomalies. As the UK Financial Conduct Authority (FCA, 2025) highlights, such "uneconomic or irrational trading strategies" may signal potential money laundering activity. Since forensic investigation is beyond the scope of this analysis, these entries were excluded to preserve analytical integrity.
 
 
 ```{r}
-# 3) Set interest = 0 for "sukuk crowdfunding" 
-if ("interest" %in% names(df)) {
-  df <- df  %>%
+# Set interest = 0 for "sukuk crowsukukunding" 
+if ("interest" %in% names(sukuk)) {
+  sukuk <- sukuk  %>%
     mutate(interest = num(interest),
-           interest = ifelse((("type" %in% names(df)) &
+           interest = ifelse((("type" %in% names(sukuk)) &
                                 str_detect(str_to_lower(type), "crowd")
            ) |
-             (("description" %in% names(df)) &
+             (("description" %in% names(sukuk)) &
                 str_detect(str_to_lower(description), "crowd")
              ), 0, interest))
 }
 
-df <- df %>% 
+# Remove rows with missing interest values, as handling them is beyond the scope of this analysis
+sukuk <- sukuk %>% 
   filter(!is.na(interest))
 ```
 
-
+The current_amt and total_scripless columns were dropped due to missing and inconsistent values. current_amt was later recalculated as originated_amt - total_own for better accuracy.
 ```{r}
-# 4) delete column "current aminities" & "Total Scripless" 
-df <- df  %>% 
+# delete column "current aminities" & "total_own Scripless" 
+sukuk <- sukuk  %>% 
   select(-any_of(c("current_amt","total_scripless")))
 ```
 
+## Data Imputation Strategy
 
+To handle missing values, domain-specific imputations were applied to maintain consistency and reflect the financial nature of the instruments:
 
+Interest Frequency
+Missing values were treated as zero-coupon or discount sukuk. These were imputed with “SPECIFIC DATE” to represent their non-periodic payment structure, based on how most similar instruments were recorded.
 
-data preprocessing and cleaning
+Listing Date
+Since many missing entries corresponded to instruments where the listing date and issuance date are typically the same, missing values were replaced with the issuance date, following the dominant pattern in the dataset.
+
+Sector
+Missing values occurred primarily in government-issued sukuk. These were imputed as “GOVERNMENT”, consistent with the classification applied to the majority of similar instruments.
+
+Interest Type
+For Sukuk Crowd Funding instruments lacking interest type information, the value “Floating/Variable” was assigned to reflect their flexible return mechanism, in line with how most entries of this instrument type were classified.
+
 ```{r}
-# 2) Combine Local_* + Foreign_* into new columns, then make 'totl' and drop sources (except IS as requested)
+sukuk <- sukuk %>%
+  mutate(
+    # 1. Impute missing interest frequency as "SPECIFIC DATE" 
+    interest_freq = if_else(is.na(interest_freq) | interest_freq == "",
+                            "SPECIFIC DATE", interest_freq),
+
+    # 2. Replace missing listing_date with the issuance date,
+    listing_date = if_else(is.na(listing_date), date, listing_date),
+
+    # 3. Assign missing sector values to "GOVERNMENT",
+    sector = if_else(is.na(sector) | sector == "",
+                     "GOVERNMENT", sector),
+
+    # 4. Impute missing interest_type as "Floating/Variable",
+    interest_type = if_else(is.na(interest_type) | interest_type == "",
+                            "Floating/Variable", interest_type)
+  )
+```
+
+```{r, fig.width=10, fig.height=8}
+# Count the number of missing values in each column to verify the impact of cleaning and imputation
+sapply(sukuk, function(x) sum(is.na(x)))
+```
+
+To simplify ownership structure and ensure consistency across investor categories, local and foreign holdings were combined into unified columns (e.g., securities_firms, mutual_funds, etc.). These were then used to calculate total_own, representing the total amount purchased by investors. The original source columns were removed to reduce redundancy. This transformation was essential for comparing market demand (total_own) with the issued volume (originated_amt) and assessing the absorption level of each sukuk instrument.
+```{r}
+# Combine Local_* + Foreign_* into new columns, then make 'total' and drop sources (except IS as requested)
 num <- function(x) parse_number(as.character(x))
 
-df <- df  %>% 
+
+sukuk <- sukuk  %>% 
   mutate(
     securities_firms     = num(local_is) + num(foreign_is),
     pension_funds        = num(local_cp) + num(foreign_cp),
@@ -116,7 +208,7 @@ df <- df  %>%
     securities_comp      = num(local_sc) + num(foreign_sc),
     direct               = num(local_fd) + num(foreign_fd),
     other                = num(local_ot) + num(foreign_ot),
-    total = rowSums(across(c(securities_firms, pension_funds, financing_comp, investment_banks,
+    total_own = rowSums(across(c(securities_firms, pension_funds, financing_comp, investment_banks,
                             institutional_invest, mutual_funds, securities_comp, direct, other)), na.rm = TRUE)
   )  %>% 
   select(-any_of(c("local_cp","foreign_cp","local_pf","foreign_pf","local_ib","foreign_ib",
@@ -127,30 +219,35 @@ df <- df  %>%
 ```
 
 
+next step ensured consistent date handling by standardizing inputs with the to_date() function and converting relevant fields into Date objects. The variable mature was then derived to represent sukuk tenor in years as the difference between maturity and listing dates.
 ```{r}
-# 5) Parse tanggal & 'mature' (tahun sejak listing hingga maturity)
+# ===== 5) Parse date columns & calculate 'mature' (years from listing to maturity) 
+# Custom function to convert raw values into Date objects:
+# - If numeric → treat as Excel serial date (origin "1899-12-30")
+# - If character → parse using common formats (ymd, dmy, mdy)
 to_date <- function(x) {
   if (is.numeric(x)) as.Date(x, origin = "1899-12-30")
   else as.Date(parse_date_time(as.character(x), orders = c("ymd","dmy","mdy")), origin = "1970-01-01")
 }
-date_cols <- intersect(names(df), c("date","listing_date","maturity_date"))
-if (length(date_cols)) df <- df |> mutate(across(all_of(date_cols), to_date))
+date_cols <- intersect(names(sukuk), c("date","listing_date","maturity_date"))
+if (length(date_cols)) sukuk <- sukuk |> mutate(across(all_of(date_cols), to_date)) # convert them into proper Date objects
 
-if (all(c("listing_date","maturity_date") %in% names(df))) {
-  df <- df |> mutate(mature = as.numeric(maturity_date - listing_date) / 365.25)
+# calculate the tenor ('mature') in years = (maturity - listing) / 365.25
+if (all(c("listing_date","maturity_date") %in% names(sukuk))) {
+  sukuk <- sukuk |> mutate(mature = as.numeric(maturity_date - listing_date) / 365.25)
 }
 
-write.csv(df,"clean.csv")
 ```
+## Metrics and Variabel
 
+Then we created a step that standardizes the interest frequency into numeric values (e.g., monthly = 12, semi-annual = 2) and combines it with the tenor to calculate the total number of expected payments over each sukuk’s lifetime, before removing the temporary cleaned column to keep the dataset tidy.
 
-data Preprocessing
 ```{r}
 
-
-df <- df %>%
+#create total interest payments count
+sukuk <- sukuk %>%
   mutate(
-    interest_freq_clean = str_trim(str_to_lower(interest_freq)),
+    interest_freq_clean = str_trim(str_to_lower(interest_freq)), # Clean interest frequency text: convert to lowercase and trim spaces
 
     interest_freq_num = case_when(
       interest_freq_clean == "specific date" ~ 1,
@@ -159,39 +256,38 @@ df <- df %>%
       interest_freq_clean == "4 months"      ~ 3,
       interest_freq_clean == "semi-annual"   ~ 2
     ),
-
+# Calculate total number of payments over the sukuk’s lifetime
+# (tenor in years * number of payments per year)
     payments_count = as.integer(round(mature * interest_freq_num))
+# Drop the temporary cleaned text column to keep dataset tidy
     
   ) %>%
   select(-interest_freq_clean)
 
 ```
 
+Market-related metrics were developed to capture sukuk performance, including days_purchase (time since listing), curr_amt (remaining unsubscribed amount), sold_per_day (average daily subscriptions), subscription_rate (proportion of issuance subscribed, capped at 100%), absorption_speed (subscription efficiency adjusted for time), and payments_interest (estimated total interest over the sukuk’s lifetime based on payment frequency, rate, and subscribed amount). The sector variable was also consolidated into broader categories (e.g., Finance, Consumer & Services, Government) for clearer analysis. The subscription rate was capped at 100% using pmin(total_own / originated_amt, 1.0) to treat oversubscription as full success, reflecting business logic that once an issuance is fully subscribed, additional demand no longer alters the outcome; in predictive modeling, the focus is therefore on whether a sukuk succeeds, not the extent to which it exceeds expectations.
+
 
 ```{r}
-# 7) Metrik pasar: curr_amt, days_purchase, sold_per_day
-df <- df  %>% 
+# Market metrics: curr_amt, days_purchase, sold_per_day, subscription_rate, absorption_speed 
+
+sukuk <- sukuk %>% 
   mutate(
-    curr_amt = originated_amt - total
+    days_purchase = as.numeric(date - listing_date)+ 1,
+    curr_amt = as.numeric(originated_amt - total_own),
+    sold_per_day = as.numeric(total_own / days_purchase),
+    subscription_rate = as.numeric (pmin(total_own / originated_amt,1.0)),
+    absorption_speed = as.numeric(subscription_rate / log1p(days_purchase)),
+    
   )
 
-if (all(c("date","listing_date") %in% names(df))) {
-  df <- df  %>%  mutate(days_purchase = as.numeric(date - listing_date)+ 1)
-}
-
-df <- df %>% 
-  mutate(
-    sold_per_day = as.numeric(total / days_purchase),
-    sold_ratio    = as.numeric (total / originated_amt),
-    sold_speed_pct_per_day = sold_ratio / days_purchase
-  )
-
-# 8) sector_type mapping lalu drop 'sector'
+# Map sector into broader categories and drop raw 'sector' column
 map_sector <- function(x) {
   s <- toupper(trimws(as.character(x)))
   case_when(
     # Finance
-    s %in% c("GOVERNMENT","BANK","FINANCIAL INSTITUTION","INVESTMENT COMPANY","OTHERS - FINANCE") ~ "Finance",
+    s %in% c("BANK","FINANCIAL INSTITUTION","INVESTMENT COMPANY","OTHERS - FINANCE") ~ "Finance",
     # Consumer & Services
     s %in% c("ADVERTISING,PRINTING AND MEDIA","COSMETICS AND HOUSEHOLD","FOOD & BEVERAGES","HOUSEWARE",
              "PHARMACEUTICALS","HEALTH CARE","RESTAURANT, HOTEL & TOURISM","TEXTILE, GARMENT",
@@ -208,38 +304,363 @@ map_sector <- function(x) {
     s %in% c("TOLL ROAD, AIRPORT, HARBOR & ALLIED PROD.","TRANSPORTATION","PROPERTY AND REAL ESTATE",
              "OTHERS - INFRASTRUCTURE, UTILITIES & TRANSPORTATIO") ~ "Infrastructure & Transportation",
     # Government
-    #s %in% c("GOVERNMENT") ~ "Government",
+    s %in% c("GOVERNMENT") ~ "Government",
     TRUE ~ NA_character_
   )
 }
 
-if ("sector" %in% names(df)) {
-  df <- df |> mutate(sector_type = map_sector(sector)) |> select(-sector)
+if ("sector" %in% names(sukuk)) {
+  sukuk <- sukuk |> mutate(sector_type = map_sector(sector)) |> select(-sector)
 }
 
-df <- df |>
+# Estimate total interest payments 
+sukuk <- sukuk |>
   mutate(
-    payments_total = ifelse(!is.na(payments_count) & !is.na(interest) & !is.na(total),
-                            payments_count * (interest/100) * total, NA_real_)
+    payments_interest = ifelse(!is.na(payments_count) & !is.na(interest) & !is.na(total_own),
+                            payments_count * (interest/100) * total_own, NA_real_)
   )
 ```
 
+
+
+```{r}
+str(sukuk)
+```
+# 4. Explanatory Data Analysis (EDA)
+
+## Skewness Testing and Interpretation
+
+The first step was to test for skewness in all numeric variables by plotting their distributions. This diagnostic is important because highly skewed variables can violate regression assumptions and bias model performance.
+
+The results show that several variables (originated_amt, total_own, curr_amt, sold_per_day, payments_interest) are extremely right-skewed, with most observations concentrated near zero and a few very large outliers. Variables such as mature and days_purchase also display positive skewness, while interest_freq_num and payments_count show discrete multimodal patterns, reflecting standard payment structures. Subscription_rate is strongly concentrated at 1.0 due to capping, and absorption_speed shows a bimodal tendency with peaks near 0 and around 1–1.5.
+
+In summary: This skewness test demonstrates that many financial variables follow heavy-tailed distributions, which is typical of issuance and subscription data where a small number of instruments dominate. Based on these results, log transformation was applied in the next step to reduce skewness, stabilize variance, and improve the suitability of the data for regression modeling.
+
 ```{r, fig.width=10, fig.height=8}
-sapply(df, function(x) sum(is.na(x)))
+# Select only numeric columns from sukuk dataset
+num_sukuk <- dplyr::select_if(sukuk, is.numeric)
+
+# Reshape (melt) into long format: variable name + value
+dt_long <- melt(num_sukuk,
+                variable.name = "variable",
+                value.name = "value",
+                na.rm = TRUE)
+# Plot histogram for each numeric variable
+ggplot(dt_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~ variable, scales = "free", ncol = 5) +
+  labs(title = "Distribution all numeric variable",
+       x = NULL, y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+## outliers detection
+we create  outlier_summary_table() function to identifies outliers in all numeric columns of the sukuk dataset using the IQR method, summarizes their counts and percentages, and classifies whether each variable has a low, moderate, or high number of outliers
+
+```{r}
+#create function to identify outliers
+outlier_summary_table <- function(sukuk) {
+  # Inner function to find outliers in a numeric vector
+  find_outliers_iqr <- function(x) {
+    if (!is.numeric(x)) return(NULL)
+    Q1 <- quantile(x, 0.25, na.rm = TRUE)
+    Q3 <- quantile(x, 0.75, na.rm = TRUE)
+    IQR_val <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR_val
+    upper_bound <- Q3 + 1.5 * IQR_val
+    outliers <- x[x < lower_bound | x > upper_bound]
+    return(outliers)
+  }
+  
+  # Identify numeric columns
+  numeric_cols <- sapply(sukuk, is.numeric)
+  
+  # Get outliers for each numeric column
+  outliers_list <- sapply(sukuk[, numeric_cols, drop=FALSE], find_outliers_iqr)
+  outlier_counts <- sapply(outliers_list, length)
+  sample_sizes <- sapply(sukuk[, numeric_cols, drop=FALSE], function(x) sum(!is.na(x)))
+  outlier_percentages <- round((outlier_counts / sample_sizes) * 100, 2)
+  
+  # Create summary table
+  outlier_summary <- data.frame(
+    N = sample_sizes,
+    Outliers_Count = outlier_counts,
+    Outlier_Percentage = outlier_percentages
+  )
+  
+  # Add interpretation
+  outlier_summary$Interpretation <- ifelse(
+    outlier_summary$Outlier_Percentage > 10, 
+    "High number of outliers", 
+    ifelse(
+      outlier_summary$Outlier_Percentage > 5,
+      "Moderate number of outliers",
+      "Low number of outliers"
+    )
+  )
+  
+  print(outlier_summary, row.names=FALSE)
+  invisible(outlier_summary)
+}
+
 ```
 ```{r}
-str(df)
+#view outliers summary
+outlier_summary_table(sukuk)
+```
+The IQR-based diagnostic showed that several variables, including originated_amt, total_own, curr_amt, sold_per_day, subscription_rate, and payments_interest, contain a high proportion of outliers (above 10%), but these reflect genuine market conditions such as large issuances or oversubscriptions rather than data errors. Since the subscription rate was capped at 100%, extreme values in other metrics represent natural variation in sukuk sizes and investor demand. Outliers were therefore retained, as tree-based models like XGBoost are robust to skewed or heavy-tailed distributions by splitting data on thresholds rather than assuming normality. Boxplots further confirmed these patterns, showing heavy tails for financial variables and discrete or capped distributions for categorical-like metrics. To reduce skewness and stabilize variance, the variables need to be log-transformed, ensuring more balanced inputs for regression modeling while preserving the outlier information.
+
+```{r, fig.width=10, fig.height=7}
+# Helper function: create a boxplot for one variable
+create_boxplot <- function(sukuk, var_name, title = NULL) {
+  if (is.null(title)) title <- gsub("_", " ", var_name)
+  ggplot(sukuk, aes(x = "", y = .data[[var_name]])) +
+    geom_boxplot(fill = "skyblue", outlier.color = "red", na.rm = TRUE) +
+    labs(title = title, y = gsub("_", " ", var_name)) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 10, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+      panel.grid.major.x = element_blank(),
+      axis.title.x = element_blank(),
+      axis.text.x  = element_blank(),
+      axis.title.y = element_blank()
+    )
+}
+
+# Select all numeric variables from sukuk
+vars_boxplot <- names(sukuk)[sapply(sukuk, is.numeric)]
+
+# Generate a list of boxplots (one for each numeric variable)
+plot_list <- lapply(vars_boxplot, function(v) create_boxplot(sukuk, v))
+
+# Arrange and display boxplots in a grid layout (5 columns per row)
+grid.arrange(grobs = plot_list, ncol = 5)
 ```
 
 
+```{r}
+describe(sukuk)
+```
 
+## Monthly Trend Analysis : Subscription Rate & Volume Trends
+
+This step was conducted to explore potential seasonal and temporal patterns in sukuk issuance. By aggregating the data at a monthly level, we can observe how subscription rates and issuance volumes evolve across months and whether certain periods consistently show stronger or weaker performance. Visualizing these trends faceted by year allows for direct comparison across time, making it easier to identify recurring issuance cycles, seasonal peaks, or anomalies. Such insights are valuable for understanding market dynamics, planning future issuances, and improving predictive modeling by incorporating temporal factors.
 ```{r, fig.width=10, fig.height=8}
-write_csv(df,"cleaned_lm.csv")
-# pilih hanya kolom numeric/integer
-num_df <- dplyr::select_if(df, is.numeric)
+# Extract year and month from date
+sukuk_trends <- sukuk %>%
+  mutate(
+    date_clean = as.Date(date, origin = "1970-01-01"),
+    year = year(date_clean),
+    month = month(date_clean)
+  ) 
 
-# hitung correlation matrix
-cor_matrix <- cor(num_df, use = "complete.obs")
+# Aggregate by year-month
+monthly_trends <- sukuk_trends %>%
+  group_by(year, month) %>%
+  summarise(
+    avg_subscription_rate = mean(subscription_rate, na.rm = TRUE),
+    total_volume = sum(originated_amt, na.rm = TRUE) / 1e12,  # in trillion
+    count_issuances = n(),
+    .groups = 'drop'
+  )
+
+# PLOT 1: Subscription Rate Trends by Month (Faceted by Year)
+p1 <- ggplot(monthly_trends, aes(x = month, y = avg_subscription_rate)) +
+  geom_line(color = "#0072B2", size = 1) +
+  geom_point(color = "#0072B2", size = 2.5) +
+  # Add value labels above each point
+  geom_text(aes(label = round(avg_subscription_rate, 2)), vjust = -1.5, size = 2, color = "black") +
+  facet_wrap(~ year) +
+  labs(
+    title = "Average Subscription Rate Trends by Month",
+    subtitle = "Comparison of monthly performance across years",
+    x = "Month",
+    y = "Average Subscription Rate"
+  ) +
+  scale_x_continuous(breaks = c(1, 4, 7, 10, 12), labels = c("Jan", "Apr", "Jul", "Oct", "Dec")) +
+  expand_limits(y = max(monthly_trends$avg_subscription_rate) * 1.15)  # Add space for labels
+  
+
+# PLOT 2: Volume Trends by Month (Faceted by Year) 
+p2 <- ggplot(monthly_trends, aes(x = month, y = total_volume)) +
+  geom_col(fill = "#56B4E9", alpha = 0.8) +
+  # Add value labels above each bar
+  geom_text(aes(label = round(total_volume, 2)), vjust = -0.5, size = 2, color = "black") +
+  facet_wrap(~ year) +
+  labs(
+    title = "Issuance Volume Trends by Month",
+    subtitle = "Volume distribution across years",
+    x = "Month",
+    y = "Volume (Trillions)" # Label adjusted to match the calculation (1e12)
+  ) +
+  scale_x_continuous(breaks = c(1, 4, 7, 10, 12), labels = c("Jan", "Apr", "Jul", "Oct", "Dec")) +
+  expand_limits(y = max(monthly_trends$total_volume) * 1.1)  # Add space for labels
+
+# --- COMBINING p1 AND p2 VERTICALLY ---
+grid.arrange(
+  p1,
+  p2,
+  ncol = 1, # Set the layout to 1 column (top-bottom)
+  top = "Monthly Trend Analysis : Subscription Rate & Volume Trends" # Main Title
+)
+```
+The monthly trend analysis shows that sukuk issuance volumes stay fairly steady throughout the year, usually between 250–280 trillion, with small peaks in January and December that may be tied to fiscal cycles. In contrast, subscription rates move a bit more, dipping below 0.90 around the middle of the year before climbing back to 0.92–0.93 toward year-end. This suggests that while the supply of sukuk is quite consistent, investor demand shifts seasonally—tending to be stronger at the start and close of the year—offering practical insights for planning future issuances and understanding market behavior.
+
+## Impact of Sukuk Characteristics on Subscription Success
+
+The code groups sukuk data into meaningful categories based on profit-sharing rates, tenors, and subscription performance. It then creates visualizations to show how subscription success varies across these categories and to summarize the overall distribution of performance. Finally, the plots are combined into a single figure to provide a clear, comparative view of the factors influencing sukuk subscription outcomes.
+```{r, fig.width=10, fig.height=10}
+library(patchwork)
+
+# Prepare data with bins
+sukuk_impact <- sukuk %>%
+  mutate(
+    # Interest rate bins
+    interest_bin = cut(interest, 
+                      breaks = c(-Inf, 3, 6, 9, 12, Inf),
+                      labels = c("0-3%", "3-6%", "6-9%", "9-12%", "12%+")),
+    
+    # Tenor bins
+    tenor_bin = cut(mature,
+                   breaks = c(-Inf, 2, 5, 10, 20, Inf),
+                   labels = c("≤2Y", "2-5Y", "5-10Y", "10-20Y", "20Y+")),
+    
+    # Performance categories for coloring
+    performance = cut(subscription_rate,
+                     breaks = c(-Inf, 0.6, 0.8, 1, Inf),
+                     labels = c("Poor", "Fair", "Good", "Excellent"))
+  )
+
+p1 <- sukuk_impact %>%
+  filter(!is.na(interest_bin)) %>%
+  ggplot(aes(x = interest_bin, y = subscription_rate, fill = interest_bin)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, 
+               fill = "red", color = "darkred") +
+  scale_fill_brewer(palette = "Blues", name = "Interest Rate") +
+  labs(
+    title = "Impact of Profit-Sharing Rate on Subscription Success",
+    subtitle = "Red diamonds show mean values",
+    x = "Interest Rate Range",
+    y = "Subscription Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+p2 <- sukuk_impact %>%
+  filter(!is.na(tenor_bin)) %>%
+  ggplot(aes(x = tenor_bin, y = subscription_rate, fill = tenor_bin)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, 
+               fill = "red", color = "darkred") +
+  scale_fill_brewer(palette = "Greens", name = "Tenor") +
+  labs(
+    title = "Impact of Tenor on Subscription Success",
+    subtitle = "Red diamonds show mean values",
+    x = "Tenor Range",
+    y = "Subscription Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# performance distribution
+p3 <- sukuk_impact %>%
+  filter(!is.na(performance)) %>%
+  ggplot(aes(x = performance, fill = performance)) +
+  geom_bar(alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribution of Sukuk Subscription Performance",
+    x = "Performance Category",
+    y = "Number of Issuances"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none"
+  )
+
+
+combined_plot <- p1 / p2 / p3 +
+  plot_annotation(
+    title = "Impact of Sukuk Characteristics on Subscription Success",
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+combined_plot
+
+
+```
+The first two plots show the effect of profit-sharing rate and tenor on subscription success. Most sukuk reach subscription rates close to 1.0 regardless of interest rate, but issuances in the 6–9% range appear to perform best on average, suggesting this rate may strike an attractive balance between investor returns and issuer costs. By contrast, sukuk with very low (0–3%) or very high (9–12%) rates display more variation, with some struggling to achieve full uptake. Similarly, tenor length plays a role: short-term sukuk (≤2 years) almost always achieve full subscription, while longer maturities (10–20 years, especially 20+ years) exhibit more scattered results, with averages falling below shorter-term instruments. This indicates that investors show stronger demand for instruments with lower duration risk, while long-dated sukuk face greater uncertainty and mixed appetite.
+
+The third plot illustrates the overall distribution of subscription performance across issuances. The vast majority of sukuk are classified as “Good” (subscription rate ≥ 0.8), reinforcing that sukuk are broadly well-absorbed by the market. Only a relatively small number fall into the “Poor” (below 0.6) or “Fair” (0.6–0.8) categories, and these tend to be associated with less favorable combinations of profit-sharing rates or very long tenors. Taken together, the results suggest that sukuk generally enjoy strong demand, but their success is influenced by pricing and maturity structure—insights useful for issuers and regulators when designing future offerings.
+
+## Sector Performance Comparison
+
+we create The code to calculates and visualizes the average sukuk subscription rate by sector, highlighting sector-level differences in performance. The chart makes it easy to compare which sectors consistently achieve higher or lower investor demand, while filtering ensures only sectors with enough data (n ≥ 10) are included.
+
+```{r, fig.width=10, fig.height=5}
+  sector_performance <- sukuk_impact %>%
+    group_by(sector_type) %>%
+    summarise(
+      avg_subscription = mean(subscription_rate, na.rm = TRUE),
+      count = n(),
+      .groups = 'drop'
+    ) %>%
+    filter(count >= 10) %>%  # Only sectors with sufficient data
+    arrange(avg_subscription) %>%
+    mutate(
+      sector_type = factor(sector_type, levels = sector_type),
+      label = paste0(round(avg_subscription, 3), " (n=", count, ")")
+    )
+  
+  p2 <- ggplot(sector_performance, aes(x = sector_type, y = avg_subscription)) +
+    geom_col(aes(fill = avg_subscription), alpha = 0.8, width = 0.7) +
+    geom_text(aes(label = round(avg_subscription, 3)), 
+              hjust = -0.1, size = 3, fontface = "bold") +
+    scale_fill_gradient2(
+      low = "lightcoral", 
+      mid = "lightblue", 
+      high = "steelblue",
+      midpoint = mean(sector_performance$avg_subscription),
+      name = "Avg Rate"
+    ) +
+    coord_flip() +
+    labs(
+      title = "Sector Performance Comparison",
+      subtitle = "Average subscription rate by project sector",
+      x = "Sector Type",
+      y = "Average Subscription Rate"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "right"
+    )
+  p2
+```
+The comparison shows that sukuk issued in private-sector-related sectors such as Finance, Natural Resources, Infrastructure & Transportation, Consumer & Services, and Industry & Manufacturing all achieve very high subscription rates (above 0.96), indicating consistently strong investor demand, while the Government sector stands out with a much lower average subscription rate of around 0.53, suggesting that these issuances are less attractive to investors, possibly due to their larger scale, lower returns, or market saturation.
+
+## Correlation
+
+We calculated the Pearson correlation matrix for all numeric sukuk variables and visualized it with a clustered correlation plot, where circle size and color indicate the strength and direction of relationships. This provides a quick overview of variable dependencies and prepares the ground for further analysis and modeling.
+```{r, fig.width=10, fig.height=8}
+
+# Count correlation matrix
+cor_matrix <- cor(num_sukuk, use = "complete.obs")
 
 # Create the correlation plot visualization
 corrplot(cor_matrix, 
@@ -263,80 +684,74 @@ corrplot(cor_matrix,
          rect.lwd = 3,                # Rectangle line width
          is.corr = TRUE)              # Confirm it's a correlation matrix
 ```
+The correlation analysis shows that sukuk characteristics are closely linked to their market performance. Strong positive relationships appear between total ownership and payments interest (0.91), maturity and payment count (0.88), and originated amount and current amount (0.88), reflecting the natural mechanics of sukuk structures. On the other hand, subscription success is negatively correlated with issuance size and tenor—larger issuances (−0.52) and higher current amounts (−0.59) tend to have lower subscription rates, while longer tenors are associated with slower absorption (−0.56). These results suggest that investors prefer smaller, shorter-term sukuk, while large-scale or long-dated issuances face more challenges in achieving full uptake.
+
+
+# 5. Modeling and Training
+I built two models: a regression model and an XGBoost model. In the regression model, I checked for multicollinearity using VIF and simplified the predictors by removing redundant variables. Using this refined set of features, I then trained the XGBoost model, which showed stronger performance. This approach allowed me to select the best-performing machine learning model while keeping it consistent with my research goals.
+
+## Regression
+
+The code applies a log transformation (log1p) to skewed variables (originated_amt, total_own, sold_per_day, and payments_interest) to reduce skewness and stabilize variance, then fits a linear regression model (lm) with subscription_rate as the dependent variable, excluding curr_amt. Finally, it produces a model summary that reports coefficients, significance levels, R², and residual statistics to evaluate model fit and predictor importance.
 
 ```{r}
-describe(df)
-```
-```{r, fig.width=10, fig.height=8}
-# melt ke long
-dt_long <- melt(num_df,
-                variable.name = "variable",
-                value.name = "value",
-                na.rm = TRUE)
-
-ggplot(dt_long, aes(x = value)) +
-  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
-  facet_wrap(~ variable, scales = "free", ncol = 5) +
-  labs(title = "Distribusi Semua Variabel Numerik",
-       x = NULL, y = "Count") +
-  theme_minimal(base_size = 12) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-```
-```{r}
-df2 <- num_df %>%
-  mutate(
-    sold_per_day_log = log1p(sold_per_day),
-    originated_amt_log = log1p(originated_amt),
-    total_log = log1p(total),
-    payments_total_log = log1p(payments_total)
+# Regression model for log transformation
+sukuk_log <- num_sukuk %>%
+   mutate(
+    # Apply log transformation (log1p = log(1+x)) to reduce skewness 
+    originated_amt_log    = log1p(originated_amt),
+    total_own_log         = log1p(total_own),
+    sold_per_day_log      = log1p(sold_per_day),
+    payments_interest_log = log1p(payments_interest)
   ) %>% 
-  select(-sold_per_day,-originated_amt,total )
-```
+  select(-sold_per_day,-originated_amt,-total_own, -payments_interest )
 
 
-```{r}
-fit <- lm(sold_ratio ~. -curr_amt, data = df2)
+# Fit a linear regression model with subscription_rate as the dependent variable.
+# All predictors are included except curr_amt (excluded due to high collinearity).
+fit <- lm(subscription_rate ~. -curr_amt, data = sukuk_log)
 summary (fit)
-car::vif(fit)
+vif(fit)
 ```
-
-
-
+The regression model explains about 84% of the variation in subscription rates, with results showing that larger issuances, longer tenors, and slower absorption reduce success, while higher ownership and faster absorption increase it. Although VIF results indicate strong multicollinearity among several variables, we do not refine the predictors here; instead, VIF was also computed on the non-transformed variables to obtain more interpretable multicollinearity diagnostics, since log transformation can alter scale without resolving underlying correlations. This step is used primarily for diagnostic purposes, since the final predictive model relies on XGBoost, which is robust to multicollinearity and better suited for capturing complex patterns in the sukuk data.
 
 ```{r}
-library(dplyr)
-library(Matrix)
-library(xgboost)
-library(Metrics)
+# Regression model for ragular variable
+fit <- lm(subscription_rate ~. -curr_amt, data = num_sukuk)
+vif(fit)
+```
+We ran a linear regression on the non-log-transformed variables to diagnose multicollinearity and guide feature selection. VIF indicated high collinearity for total_own (12.7), payments_interest (9.1), and mature (8.8), while other predictors were within acceptable limits. To prevent leakage and redundancy, we excluded outcome-related or overlapping variables—sold_per_day (overlaps with ownership and purchase timing), curr_amt, absorption_speed, and payments_interest. Crucially, total_own was removed because it directly defines the target subscription_rate (subscription_rate = total_own / originated_amt); keeping it would cause mathematical leakage and inflate accuracy. This regression served mainly for diagnostics and feature pruning, supporting the cleaner, more accurate XGBoost model. We retain subscription_rate as the target, as it reflects issuance success and market demand, consistent with the World Bank’s sovereign sukuk framework that treats (over)subscription as a key indicator of investor appetite (Balibek, 2017).
 
-df_guard <- df
+```{r}
 
-# Drop ID/textual columns (not suitable as predictors)
-drop_cols <- c("code","description","date","listing_date","maturity_date",
-               "issuer","type","sector_type")   
+sukuk_guard <- num_sukuk
 
-feature_cols <- setdiff(names(df_guard), c(drop_cols, "sold_per_day"))
+# Drop ID/textual columns (not suitable as predictors) 
+drop_cols <- c("subscription_rate","sold_per_day","curr_amt",
+               "payments_interest", "absorption_speed","total_own","days_purchase")   
+
+feature_cols <- setdiff(names(sukuk_guard),drop_cols)
 
 # Convert factors into dummies (model matrix) and store as sparse matrix
-X <- model.matrix(~ . , data = df_guard[, feature_cols])[ , -1]
+X <- model.matrix(~ . , data = sukuk_guard[, feature_cols])[ , -1]
 X <- Matrix(X, sparse = TRUE)
 
 # Target variable
-y <- df_guard$sold_per_day
+y <- sukuk_guard$subscription_rate
 keep <- !is.na(y) & is.finite(y)
 X <- X[keep, ]; y <- y[keep]
+```
 
-# ===== 1) Train/Test split =====
+The dataset was first split into training (80%) and testing (20%) sets, with features and labels converted into the optimized xgb.DMatrix format. An XGBoost regression model was then configured using parameters designed to balance accuracy and generalization, including a low learning rate (eta = 0.05), moderate tree depth (max_depth = 6), sample and feature subsampling (subsample = 0.8, colsample_bytree = 0.8), and regularization terms (lambda, alpha). Model performance was evaluated using root mean squared error (RMSE), and five-fold cross-validation with early stopping (100 rounds) was applied to prevent overfitting. From this process, the best iteration (best_nrounds) was identified, providing the optimal number of boosting rounds for training the final XGBoost model.
+```{r}
+# Train/Test split 
 set.seed(123)
 idx <- sample(seq_len(nrow(X)), size = floor(0.8 * nrow(X)))
 dtrain <- xgb.DMatrix(X[idx, ],  label = y[idx])
 dtest  <- xgb.DMatrix(X[-idx, ], label = y[-idx])
 y_test <- y[-idx]
 
-
-```
-```{r}
-# ===== 2) Parameter setup & Cross-validation =====
+# Parameter setup & Cross-validation
 params <- list(
   booster = "gbtree",
   objective = "reg:squarederror",
@@ -363,11 +778,9 @@ cv <- xgb.cv(
 best_nrounds <- cv$best_iteration
 cat("Best nrounds from CV:", best_nrounds, "\n")
 ```
-
-
-
+The final XGBoost model was trained using the tuned hyperparameters and the optimal number of boosting rounds identified during cross-validation. Training progress was monitored on both the training and test sets with early stopping to prevent overfitting.
 ```{r}
-# ===== 3) Train final model =====
+# Train final model 
 set.seed(123)
 xgb_fit <- xgb.train(
   params = params,
@@ -375,23 +788,26 @@ xgb_fit <- xgb.train(
   nrounds = best_nrounds,
   watchlist = list(train = dtrain, test = dtest),
   early_stopping_rounds = 100,
-  verbose = 1
+  verbose = 0
 )
-```
 
+# show last 10 row of evaluation
+tail(xgb_fit$evaluation_log, 10)
+```
+The model's predictive accuracy was evaluated on the held-out test set using RMSE, MAE, and R². It achieved RMSE = 0.09658, MAE = 0.03365, and R² = 0.8394, indicating a strong fit—about 83.9% of the variance in subscription rates explained with reasonably low prediction error—supporting the model's robustness for sukuk success prediction.
 ```{r}
 # ===== 4) Evaluation =====
 pred <- predict(xgb_fit, dtest)
 rmse_val <- rmse(y_test, pred)
 mae_val  <- mae (y_test, pred)
 r2_val   <- 1 - sum((y_test - pred)^2) / sum((y_test - mean(y_test))^2)
-cat(sprintf("Test RMSE = %.3f | MAE = %.3f | R^2 = %.4f\n", rmse_val, mae_val, r2_val))
+cat(sprintf("Test RMSE = %.5f | MAE = %.5f | R^2 = %.6f\n", rmse_val, mae_val, r2_val))
 ```
-
+Three diagnostic plots reveal the model's good overall performance with notable limitations. The Predicted vs Actual plot shows close alignment along the diagonal, though with significant clustering at subscription rate = 1.0. The residuals histogram is centered near zero and symmetric, indicating unbiased errors overall. However, Residuals vs Predicted reveal clear systematic bias - the model consistently under-predicts high subscription rates, indicating substantial heteroscedasticity. While the XGBoost model performs well for moderate subscription levels, it has significant limitations when predicting fully subscribed sukuk.
 ```{r}
-# ===== 5) Visualization: Predicted vs Actual =====
+#Visualization: Predicted vs Actual
 plot(y_test, pred,
-     xlab = "Actual sold_per_day", ylab = "Predicted sold_per_day",
+     xlab = "Actual subsciption_rate", ylab = "Predicted subsciption_rate",
      main = "XGBoost: Predicted vs Actual", pch = 16, cex = 0.6)
 abline(0, 1, col = "red", lwd = 2)
 
@@ -402,18 +818,32 @@ plot(pred, resid, pch = 16, cex = 0.6,
      xlab = "Predicted", ylab = "Residual",
      main = "Residuals vs Predicted"); abline(h=0, col="red", lwd=2)
 ```
-
+The feature importance analysis shows that sukuk subscription rates are driven primarily by issuance size (originated_amt), accounting for 47% of predictive power. Profit-sharing rate (interest) is the second most important factor at 26%, followed by tenor (mature) at 16%. Structural factors like payment count and payment frequency contribute minimally at 7% and 3% respectively. Overall, these results suggest that issuance scale and profit-sharing rate are the dominant determinants of sukuk subscription success, with tenor playing a moderate role.
 ```{r}
 # ===== 6) Feature importance =====
 imp <- xgb.importance(model = xgb_fit, feature_names = colnames(X))
-print(head(imp, 20))
-# Plot if needed:
-xgb.plot.importance(imp[1:20, ])
+print(head(imp, 10))
+
+top_10 <- head(imp, 10)
+top_10$Feature <- factor(top_10$Feature, levels = rev(top_10$Feature))
+
+# horizontal bar
+p1 <- ggplot(top_10, aes(x = Feature, y = Gain)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Top 10 Key Success Factors",
+       subtitle = "Factors Influencing Sukuk Subscription Rate",
+       x = "Features",
+       y = "Importance (Gain)") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+print(p1)
 ```
 
+The first decision tree shows that profit-sharing rate (interest) is the primary splitting criterion, with threshold around 6.68%. This is followed by tenor (mature) and payment frequency (interest_freq_num) as secondary factors. Multiple splits on interest at different thresholds (6.56%, 8.69%) suggest non-linear relationships between profit-sharing rates and subscription success. While feature importance analysis showed originated_amt as most important globally, this individual tree highlights how interest rate thresholds create the most informative splits for prediction.
 
 ```{r}
-# ===== 7) Tree structure example =====
 # Visualize the first decision tree
 xgb.plot.tree(model = xgb_fit, trees = 0)
 
@@ -437,33 +867,41 @@ sv <- shapviz(
 )
 
 # Prefer explicit helpers (avoid generic plot ambiguity)
-# ---- PLOTS (benar) ----
-# 1) "Summary" beeswarm (ganti sv_summary -> sv_importance(kind="bee"))
-sv_importance(sv, kind = "bee")
-
 summary(sv)
-
-# 2) Global importance (bar)
 sv_importance(sv, kind = "bar")
-
-# 3) Dependence (contoh pakai fitur "interest", sesuaikan nama kolom di mm)
 sv_dependence(sv, v = "interest")
-
-# 4) Waterfall untuk observasi ke-1
 sv_waterfall(sv, row_id = 1)
 ```
 
 
-```{r}
-# ===== 8) Feature importance =====
-imp <- xgb.importance(model = xgb_fit, feature_names = colnames(X))
-print(head(imp, 20))
-# Plot (aktifkan jika ingin)
-# xgb.plot.importance(imp[1:20, ])
+The SHAP analysis provides an interpretable view of the XGBoost model. The importance plot shows that profit-sharing rate (interest) is the dominant factor, followed by issuance size (originated_amt), tenor (mature), payment frequency, and payment count. The dependence plot illustrates that moderate profit-sharing rates generally increase success probabilities, with interactions influenced by tenor length. The waterfall plot shows how all features contribute positively to push the prediction from baseline 0.909 to 0.997, with tenor and issuance size providing the largest contributions.
 
-# ===== 9) (Opsional) Simpan model & prediksi =====
+
+```{r}
+# ===== 9) (Optional) Save model and Prediction =====
 # xgb.save(xgb_fit, "xgb_sold_per_day.model")
 # write.csv(data.frame(actual = y_test, pred = pred), "predictions_test.csv", row.names = FALSE)
 ```
+
+And with that, we have reached the conclusion of the analysis for this dataset. We have conducted a comprehensive exploration and modeling process, covering a wide range of analyses to address the central question of sukuk subscription success. This work serves as an initial prototype model, laying the foundation for potential application in real-world sukuk issuance and market analysis.
+
+By refining the model further and incorporating additional features or real-time market data, this prototype could evolve into a powerful decision-support tool for issuers and regulators, enabling more informed structuring of sukuk offerings, enhancing investor confidence, and strengthening overall market performance.
+
+
+References :
+
+Financial Conduct Authority (FCA). (2025). Money laundering through markets review.         
+          https://www.fca.org.uk/publication/corporate/money-laundering-through-markets-review-january-2025.psukuk
+
+Balibek, E. (2017). Establishing a legal framework for sovereign sukuk issuance: A public debt management perspective (MFM Discussion Paper No. 18).     
+          Washington, DC: World Bank Group. 
+          http://documents.worldbank.org/curated/en/907001497472893193
+
+
+
+
+
+
+
 
 
